@@ -53,14 +53,6 @@ function normalizeAgentVersion(value) {
     .slice(0, 64);
 }
 
-function getRequestIp(request) {
-  const directIp = request.headers?.get('cf-connecting-ip') || request.headers?.get('x-real-ip') || '';
-  if (directIp) return directIp.trim().slice(0, 128);
-
-  const forwardedFor = request.headers?.get('x-forwarded-for') || '';
-  return forwardedFor.split(',')[0].trim().slice(0, 128);
-}
-
 function createAgentInstructionResponse(body) {
   return new Response(body, {
     status: 200,
@@ -105,15 +97,41 @@ function normalizeMetricSamples(data) {
   return samples.slice(-MAX_BATCH_SAMPLES);
 }
 
-function toBroadcastSamples(id, samples, regionCode, agentVersion = '') {
-  return samples.map(sample => {
-    const payload = buildPayloadForBroadcast(id, sample.metrics || {}, {
+function getReportMetrics(data, latestSample) {
+  const reportMetrics = data?.metrics && typeof data.metrics === 'object' ? data.metrics : null;
+  if (!reportMetrics) return latestSample?.metrics || {};
+  return {
+    ...reportMetrics,
+    ...(latestSample?.metrics || {})
+  };
+}
+
+function buildSamplePayloadForBroadcast(metrics = {}, timestamp = Date.now()) {
+  const payload = metrics && typeof metrics === 'object' ? { ...metrics } : {};
+  BROADCAST_DELETE_FIELDS.forEach(field => delete payload[field]);
+  payload.last_updated = timestamp;
+  payload.sample_timestamp = timestamp;
+  return payload;
+}
+
+function toBroadcastSamples(id, samples, regionCode, agentVersion = '', reportMetrics = null) {
+  const lastIndex = samples.length - 1;
+  return samples.map((sample, index) => {
+    const metrics = reportMetrics && typeof reportMetrics === 'object' && index === lastIndex
+      ? { ...reportMetrics, ...(sample.metrics || {}) }
+      : (sample.metrics || {});
+    if (index !== lastIndex) {
+      return { ts: sample.ts, payload: buildSamplePayloadForBroadcast(metrics, sample.ts) };
+    }
+
+    const payload = buildPayloadForBroadcast(id, metrics, {
       region: regionCode,
       agentVersion,
       timestamp: sample.ts
     });
     const filtered = Object.assign({}, payload);
     BROADCAST_DELETE_FIELDS.forEach(field => delete filtered[field]);
+    filtered.sample_timestamp = sample.ts;
     return { ts: sample.ts, payload: filtered };
   });
 }
@@ -181,7 +199,6 @@ export async function handleUpdate(request, env, ctx) {
     }
 
     let regionCode = request.cf?.country || request.headers?.get('cf-ipcountry') || '';
-    const ip = getRequestIp(request);
     const agentVersion = normalizeAgentVersion(request.headers.get('X-Agent-Version'));
 
     const serverDetail = await getServerDetail(env.DB, id, true);
@@ -240,18 +257,18 @@ export async function handleUpdate(request, env, ctx) {
 
     // 获取最后一条插入（如果是批量数据，取最后一个样本）
     const latestSample = samples[samples.length - 1];
+    const latestMetrics = getReportMetrics(data, latestSample);
     await saveMetricsHistory(
       env.DB,
       id,
       historyPartitionId,
-      latestSample.metrics,
+      latestMetrics,
       regionCode,
       latestSample.ts,
-      agentVersion,
-      ip
+      agentVersion
     );
 
-    const broadcastSamples = toBroadcastSamples(id, samples, regionCode, agentVersion);
+    const broadcastSamples = toBroadcastSamples(id, samples, regionCode, agentVersion, latestMetrics);
     cacheLatestReportUpdate(id, broadcastSamples, Date.now());
     // 加入批量队列，由后台定时任务统一推送到 DO
     queueBroadcastSamples(id, broadcastSamples);

@@ -1,10 +1,25 @@
 <template>
-  <div class="container">
+  <div class="container" :class="{ 'mikus-dashboard': isMikusTheme }">
     <TerminalHeader :title="sysConfig.site_title || DEFAULT_SITE_TITLE" />
     
-    <div v-if="isLoading" class="loading-state">
-      <div class="loading-spinner"></div>
-      <div class="loading-text">$ {{ trans.loading }}</div>
+    <div v-if="isLoading" class="loading-state" :class="{ 'mikus-loading-state': isMikusTheme }">
+      <template v-if="isMikusTheme">
+        <div class="mikus-loading-inner">
+          <img class="mikus-loading-gif" :src="mikusAsset('loli.gif')" alt="Loading">
+          <div class="mikus-loading-brand">
+            <img class="mikus-loading-logo" :src="mikusAsset('miku.png')" alt="">
+            <span>{{ sysConfig.site_title || 'Komari' }}</span>
+          </div>
+          <div class="mikus-loading-progress" aria-hidden="true">
+            <div class="mikus-loading-progress-fill"></div>
+          </div>
+          <div class="mikus-loading-status">$ {{ trans.loading }}</div>
+        </div>
+      </template>
+      <template v-else>
+        <div class="loading-spinner"></div>
+        <div class="loading-text">$ {{ trans.loading }}</div>
+      </template>
     </div>
 
     <template v-else>
@@ -52,7 +67,10 @@
       </div>
     </div>
 
-    <div class="global-stats">
+    <div class="global-stats" :class="{ 'mikus-global-stats': isMikusTheme }">
+      <div v-if="isMikusTheme" class="mikus-stats-mascot" aria-hidden="true">
+        <img class="mikus-stats-mascot-img" :src="mikusAsset('QWQ.webp')" alt="">
+      </div>
       <div class="stat-item">
         <div class="stat-label">{{ trans.totalServers }}</div>
         <div class="stat-main-value stat-main-value-sm stat-sub-info">
@@ -71,6 +89,18 @@
           <span class="stat-net-up-color">↑ {{ formatBytes(stats.globalSpeedOut) }}/s</span>
         </div>
       </div>
+      <button
+        v-if="sysConfig.show_price"
+        type="button"
+        class="stat-item stat-action-item"
+        @click="financeModalOpen = true"
+      >
+        <div class="stat-label">{{ trans.remainingValue }}</div>
+        <div class="stat-main-value stat-main-value-sm">
+          {{ formattedRemainingValue.symbol }}{{ formattedRemainingValue.value }}
+          <span class="finance-currency-code">{{ formattedRemainingValue.currency }}</span>
+        </div>
+      </button>
     </div>
 
     <div id="view-card" class="view-panel" :class="{ active: isCardView }">
@@ -218,12 +248,62 @@
       </div>
     </div>
 
+    <div v-if="financeModalOpen" class="modal-overlay active" @click.self="financeModalOpen = false">
+      <div class="modal-dialog finance-modal-dialog">
+        <div class="modal-header">
+          <div class="modal-title">$ finance --summary</div>
+          <button class="modal-close" @click="financeModalOpen = false">✕</button>
+        </div>
+
+        <div class="finance-summary-grid">
+          <div v-for="item in financeSummaryItems" :key="item.label" class="finance-summary-card">
+            <div class="finance-summary-label">{{ item.label }}</div>
+            <div class="finance-summary-value">
+              <span class="finance-summary-symbol">{{ item.symbol }}</span>{{ item.value }}
+            </div>
+          </div>
+        </div>
+
+        <div class="finance-rate-toolbar">
+          <div>
+            <div class="finance-section-label">{{ trans.todayExchangeRates }}</div>
+            <div class="finance-source-text">{{ trans.exchangeRateSource }}: {{ financeRateSourceText }}</div>
+          </div>
+          <label class="finance-currency-picker">
+            <span>{{ trans.exchangeRateBase }}</span>
+            <select :value="financeCurrency" class="form-select" @change="setFinanceCurrency">
+              <option v-for="currency in financeRateCurrencies" :key="currency" :value="currency">
+                {{ currency }}
+              </option>
+            </select>
+          </label>
+        </div>
+
+        <div class="finance-rate-grid">
+          <div v-for="row in exchangeRateRows" :key="row.currency" class="finance-rate-row">
+            <span>{{ row.currency }}</span>
+            <b>{{ row.targetSymbol }}{{ row.rate }}</b>
+          </div>
+        </div>
+
+        <div class="finance-modal-meta">
+          <span>{{ trans.configuredPrices }}: {{ financeSummary.configuredCount }}</span>
+          <span>{{ trans.expired }}: {{ financeSummary.expiredCount }}</span>
+          <span>{{ trans.financeMissingExpire }}: {{ financeSummary.missingExpireCount }}</span>
+        </div>
+
+        <div class="modal-footer flex-justify-end">
+          <button @click="financeModalOpen = false" class="btn">OK</button>
+        </div>
+      </div>
+    </div>
+
     <Footer />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, inject, onMounted, onUnmounted } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import ServerBarCard from '../components/ServerBarCard.vue'
@@ -238,17 +318,32 @@ import { TIME, DEFAULT_SITE_TITLE, STORAGE } from '../utils/constants'
 import { normalizeTimestamp as normalizeMetricTimestamp } from '../utils/time.js'
 import { normalizeDashboardView, normalizeDisplayMode, resolveDisplayMode } from '../utils/displayMode.js'
 import { getPlaybackElapsedMs, resolvePlaybackCursor } from '../utils/playback.js'
+import { getMikusAssetUrl, isMikusThemeEnabled, normalizeThemeOptions, setMikusThemeClass } from '../utils/themeOptions.js'
+import {
+  CURRENCY_SYMBOLS,
+  DEFAULT_EXCHANGE_RATES,
+  DISPLAY_FINANCE_CURRENCIES,
+  calculateFinanceSummary,
+  convertCnyAmount,
+  formatFinanceAmount,
+  getDailyExchangeRates,
+  getStoredFinanceCurrency,
+  normalizeFinanceCurrency,
+  setStoredFinanceCurrency
+} from '../utils/finance.js'
 
 const servers = ref([])
 const stats = ref({ total: '-', online: 0, offline: 0, globalNetRx: 0, globalNetTx: 0, globalSpeedIn: 0, globalSpeedOut: 0 })
 const unknownStats = ref(0)
+const appConfig = inject('appConfig', null)
 const sysConfig = ref({
   show_price: true,
   show_expire: true,
   show_tf: true,
   show_time: true,
   display_mode: 'bar',
-  site_title: DEFAULT_SITE_TITLE
+  site_title: DEFAULT_SITE_TITLE,
+  theme_options: normalizeThemeOptions(appConfig?.theme_options)
 })
 const regionStats = ref({})
 const currentView = ref('bar')
@@ -258,11 +353,87 @@ const liveConnected = ref(false)
 const isLoading = ref(true)
 const sitesRemaining = ref(0)
 const hasCorsError = ref(null)
+const financeModalOpen = ref(false)
+const financeCurrency = ref('CNY')
+const exchangeRates = ref(DEFAULT_EXCHANGE_RATES)
+const exchangeRateSource = ref('default')
 const now = ref(Date.now())
 const router = useRouter()
 
 const trans = useTranslation()
-const appConfig = inject('appConfig', null)
+const financeRateCurrencies = DISPLAY_FINANCE_CURRENCIES
+const isMikusTheme = computed(() => isMikusThemeEnabled(sysConfig.value.theme_options))
+
+const mikusAsset = (filename) => getMikusAssetUrl(filename)
+
+watch(isMikusTheme, (enabled) => {
+  setMikusThemeClass(enabled)
+}, { immediate: true })
+
+const financeSummary = computed(() => calculateFinanceSummary(servers.value, exchangeRates.value, now.value))
+const formattedRemainingValue = computed(() => formatFinanceMetric(financeSummary.value.remainingValueCNY))
+const formattedTotalValue = computed(() => formatFinanceMetric(financeSummary.value.totalValueCNY))
+const formattedMonthlyAverageCost = computed(() => formatFinanceMetric(financeSummary.value.monthlyAverageCostCNY))
+
+const createFinanceSummaryItem = (label, metric) => ({
+  label,
+  symbol: metric.symbol,
+  value: metric.value
+})
+
+const financeSummaryItems = computed(() => [
+  createFinanceSummaryItem(trans.value.totalValue, formattedTotalValue.value),
+  createFinanceSummaryItem(trans.value.remainingValue, formattedRemainingValue.value),
+  createFinanceSummaryItem(trans.value.monthlyAverageCost, formattedMonthlyAverageCost.value)
+])
+
+const exchangeRateRows = computed(() => {
+  const baseRate = exchangeRates.value[financeCurrency.value] || DEFAULT_EXCHANGE_RATES[financeCurrency.value] || 1
+  return financeRateCurrencies.map(currency => {
+    const targetRate = exchangeRates.value[currency] || DEFAULT_EXCHANGE_RATES[currency] || 1
+    const rate = targetRate / baseRate
+    return {
+      currency,
+      targetSymbol: CURRENCY_SYMBOLS[currency] || '',
+      rate: new Intl.NumberFormat('zh-CN', {
+        maximumFractionDigits: 6,
+        minimumFractionDigits: 6
+      }).format(rate)
+    }
+  })
+})
+
+const financeRateSourceText = computed(() => {
+  const sourceText = {
+    network: trans.value.financeRateNetwork,
+    cache: trans.value.financeRateCache,
+    'stale-cache': trans.value.financeRateStaleCache,
+    default: trans.value.financeRateDefault
+  }
+  return sourceText[exchangeRateSource.value] || sourceText.default
+})
+
+const formatFinanceMetric = (amountCNY) => {
+  return formatFinanceAmount(convertCnyAmount(amountCNY, financeCurrency.value, exchangeRates.value), financeCurrency.value)
+}
+
+const setFinanceCurrency = (event) => {
+  const currency = normalizeFinanceCurrency(event?.target?.value)
+  financeCurrency.value = currency
+  setStoredFinanceCurrency(currency)
+}
+
+const loadFinanceRates = async () => {
+  try {
+    const { rates, source } = await getDailyExchangeRates()
+    exchangeRates.value = rates
+    exchangeRateSource.value = source
+  } catch (e) {
+    console.log('[INFO] Finance rates fallback:', e)
+    exchangeRates.value = DEFAULT_EXCHANGE_RATES
+    exchangeRateSource.value = 'default'
+  }
+}
 
 const filterOptions = computed(() => {
   const normalizedStats = {}
@@ -591,7 +762,8 @@ const loadDashboardConfig = async () => {
     sysConfig.value = {
       ...sysConfig.value,
       site_title: hasMultipleApiBases() && localTitle ? localTitle : (siteTitle || sysConfig.value.site_title),
-      display_mode: resolveDisplayMode(config)
+      display_mode: resolveDisplayMode(config),
+      theme_options: normalizeThemeOptions(config?.theme_options)
     }
   } catch (e) {
     console.log('[INFO] Dashboard config pending...', e)
@@ -622,7 +794,8 @@ const refreshData = async () => {
           show_tf: data.sysConfig?.show_tf ?? true,
           show_time: data.sysConfig?.show_time ?? true,
           display_mode: normalizeDisplayMode(data.sysConfig?.display_mode),
-          site_title: sysConfig.value.site_title || DEFAULT_SITE_TITLE
+          site_title: sysConfig.value.site_title || DEFAULT_SITE_TITLE,
+          theme_options: sysConfig.value.theme_options
         }
 
         if (data.corsErrorSites?.length && !hasCorsError.value) hasCorsError.value = [...data.corsErrorSites]
@@ -658,7 +831,8 @@ const refreshData = async () => {
       show_tf: data.sysConfig?.show_tf ?? true,
       show_time: data.sysConfig?.show_time ?? true,
       display_mode: normalizeDisplayMode(data.sysConfig?.display_mode),
-      site_title: sysConfig.value.site_title || DEFAULT_SITE_TITLE
+      site_title: sysConfig.value.site_title || DEFAULT_SITE_TITLE,
+      theme_options: sysConfig.value.theme_options
     }
 
     drawMarkers()
@@ -850,6 +1024,9 @@ const goToServer = (server) => {
 }
 
 onMounted(async () => {
+  financeCurrency.value = getStoredFinanceCurrency()
+  loadFinanceRates()
+
   await loadDashboardConfig()
   const rawSavedView = localStorage.getItem(STORAGE.VIEW_PREFERENCE)
   const savedView = normalizeDashboardView(rawSavedView, sysConfig.value.display_mode)

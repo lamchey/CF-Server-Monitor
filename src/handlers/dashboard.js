@@ -12,12 +12,56 @@ import {
 
 const LATEST_REPORT_ID_CHUNK_SIZE = 500;
 
+function toPublicIpReachability(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return normalized && normalized !== '0' && normalized !== 'false' ? '1' : '0';
+}
+
+function normalizePublicIpFields(item, ensureFields = true) {
+  if (ensureFields || Object.prototype.hasOwnProperty.call(item, 'ip_v4')) {
+    item.ip_v4 = toPublicIpReachability(item.ip_v4);
+  }
+  if (ensureFields || Object.prototype.hasOwnProperty.call(item, 'ip_v6')) {
+    item.ip_v6 = toPublicIpReachability(item.ip_v6);
+  }
+  for (const field of ['data', 'payload', 'metrics']) {
+    if (item[field] && typeof item[field] === 'object' && !Array.isArray(item[field])) {
+      item[field] = normalizePublicIpFields({ ...item[field] }, false);
+    }
+  }
+  return item;
+}
+
 function withoutPrivateServerFields(server) {
   const item = { ...server };
   delete item.bandwidth;
   delete item.note;
   delete item.auto_update;
-  return item;
+  return normalizePublicIpFields(item);
+}
+
+function normalizeLatestReportSample(sample) {
+  if (!sample || typeof sample !== 'object') return null;
+  const data = sample?.data || sample?.payload || sample?.metrics;
+  if (!data || typeof data !== 'object') return null;
+
+  const publicData = normalizePublicIpFields({ ...data }, false);
+  const ts = sample.ts ?? sample.timestamp;
+  return ts === undefined ? { data: publicData } : { ts, data: publicData };
+}
+
+function normalizeLatestReportUpdate(update) {
+  if (!update || !Array.isArray(update.samples)) return null;
+
+  const samples = update.samples
+    .map(normalizeLatestReportSample)
+    .filter(Boolean);
+  if (samples.length === 0) return null;
+
+  return {
+    ...update,
+    samples
+  };
 }
 
 async function getDurableLatestReportUpdates(env, serverIds) {
@@ -66,10 +110,35 @@ function mergeLatestReportUpdates(serverIds, durableUpdates, workerUpdates) {
   }
 
   const now = Date.now();
-  return serverIds.map(serverId => merged.get(String(serverId))).filter(Boolean).map(update => ({
-    ...update,
-    reportAgeMs: Math.max(0, now - Number(update.reportTs || now))
-  }));
+  return serverIds.map(serverId => merged.get(String(serverId)))
+    .filter(Boolean)
+    .map(update => normalizeLatestReportUpdate({
+      ...update,
+      reportAgeMs: Math.max(0, now - Number(update.reportTs || now))
+    }))
+    .filter(Boolean);
+}
+
+async function getLatestReportUpdatesForServers(env, serverIds) {
+  const normalizedServerIds = Array.from(new Set(
+    (Array.isArray(serverIds) ? serverIds : [])
+      .map(serverId => String(serverId || '').trim())
+      .filter(Boolean)
+  ));
+  if (normalizedServerIds.length === 0) return [];
+
+  const durableLatestReportUpdates = await getDurableLatestReportUpdates(env, normalizedServerIds);
+
+  // DO 命中后反向预热当前 Worker isolate，降低随后 DO 休眠造成的空缓存概率。
+  for (const update of durableLatestReportUpdates) {
+    cacheLatestReportUpdate(update.serverId, update.samples, update.reportTs);
+  }
+
+  return mergeLatestReportUpdates(
+    normalizedServerIds,
+    durableLatestReportUpdates,
+    getWorkerLatestReportUpdates(normalizedServerIds)
+  );
 }
 
 export async function handleServerAPI(request, env, sys) {
@@ -87,8 +156,12 @@ export async function handleServerAPI(request, env, sys) {
   const server = await getServerDetail(env.DB, id, isLoggedIn);
   if (!server) return createNotFoundResponse('Server not found');
   
-  const latestMetrics = await getLatestMetrics(env.DB, id, server);
+  const [latestMetrics, latestReportUpdates] = await Promise.all([
+    getLatestMetrics(env.DB, id, server),
+    getLatestReportUpdatesForServers(env, [id])
+  ]);
   mergeMetricsIntoServer(server, latestMetrics);
+  server.latestReportUpdates = latestReportUpdates;
   server.sysConfig = {
     long_history_points: Number(normalizeLongHistoryPoints(sys.long_history_points))
   };
@@ -106,20 +179,10 @@ export async function handleServersAPI(request, env, sys) {
   const results = (await getAllServers(env.DB, isLoggedIn)).map(withoutPrivateServerFields);
   
   const serverIds = results.map(server => server.id).filter(Boolean);
-  const [latestMetricsMap, durableLatestReportUpdates] = await Promise.all([
+  const [latestMetricsMap, latestReportUpdates] = await Promise.all([
     getLatestMetricsForAllServers(env.DB),
-    getDurableLatestReportUpdates(env, serverIds)
+    getLatestReportUpdatesForServers(env, serverIds)
   ]);
-
-  // DO 命中后反向预热当前 Worker isolate，降低随后 DO 休眠造成的空缓存概率。
-  for (const update of durableLatestReportUpdates) {
-    cacheLatestReportUpdate(update.serverId, update.samples, update.reportTs);
-  }
-  const latestReportUpdates = mergeLatestReportUpdates(
-    serverIds,
-    durableLatestReportUpdates,
-    getWorkerLatestReportUpdates(serverIds)
-  );
   
   const now = Date.now();
   let globalOnline = 0;
@@ -135,6 +198,7 @@ export async function handleServersAPI(request, env, sys) {
       isOnline = (now - latestMetrics.timestamp) < 300000;
       mergeMetricsIntoServer(server, latestMetrics);
     }
+    normalizePublicIpFields(server);
     
     if (isOnline) {
       globalOnline++;

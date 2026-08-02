@@ -260,7 +260,7 @@ Headers: (按需) Authorization: Bearer <jwt>, X-Turnstile-Token/Verified
 | `servers`     | 服务器列表（含最新指标），未登录用户自动过滤隐藏服务器；`tags` 始终随服务器返回 |
 | `stats`       | 聚合统计（在线阈值 5 分钟）             |
 | `regionStats` | 按区域统计服务器数量                  |
-| `sysConfig`   | 站点开关配置，控制 UI 显示             |
+| `sysConfig`   | 站点开关配置，控制 UI 显示；主题配置请从 `/api/config` 的 `theme_options` 读取 |
 
 **示例**：
 
@@ -326,11 +326,32 @@ Headers: (按需) Authorization, X-Turnstile-Token/Verified
   "boot_time": "1700000000000",
   "last_updated": 1737638400000,
   "timestamp": 1737638400000,
+  "latestReportUpdates": [
+    {
+      "serverId": "9b2c...",
+      "reportTs": 1737638405000,
+      "reportAgeMs": 1200,
+      "samples": [
+        {
+          "ts": 1737638400000,
+          "data": {
+            "cpu": 12.34,
+            "ram_total": 8192,
+            "ram_used": 3700,
+            "swap_total": 1024,
+            "swap_used": 64,
+            "net_in_speed": 1024,
+            "net_out_speed": 512
+          }
+        }
+      ]
+    }
+  ],
   "sysConfig": { "long_history_points": 120 }
 }
 ```
 
-`tags` 为英文逗号分隔字符串。`note` 属于管理端内部字段，不从 dashboard 公共接口返回。`gpu` 已废弃，主题应使用 `gpu_info`；新版上报和 WebSocket 实时数据为 `[{ id, name, info }]` 数组，历史/详情 REST 响应中可能是同结构的 JSON 字符串。
+`tags` 为英文逗号分隔字符串。`note` 属于管理端内部字段，不从 dashboard 公共接口返回。`latestReportUpdates` 与 `/api/servers` 同名字段形状一致，REST 样本统一为 `{ ts, data }` 并按探针采样包透传；内置探针默认只在普通采样点上报 `cpu`、`ram_total`、`ram_used`、`swap_total`、`swap_used`、`net_in_speed`、`net_out_speed`；缓存约 5 分钟，允许为空数组。`gpu` 已废弃，主题应使用 `gpu_info`；新版上报和 WebSocket 实时数据为 `[{ id, name, info }]` 数组，历史/详情 REST 响应中可能是同结构的 JSON 字符串。
 
 **失败返回**：
 
@@ -435,7 +456,9 @@ Headers: Upgrade: websocket, Connection: Upgrade
 | `subscribed` | S → C | `{ type: "subscribed", ts: number, subscribed: string, count: number }` |
 | `ping` | C → S | `{ type: "ping", ts: number }` |
 | `pong` | 双向 | `{ type: "pong", ts: number }` |
-| `batchUpdate` | S → C | `{ type: "batchUpdate", ts: number, updates: Array<{serverId, samples: Array<{ts, data}>}> }` |
+| `batchUpdate` | S → C | `{ type: "batchUpdate", ts: number, updates: Array<{serverId, samples: Array<{ts, data: Partial<Server>}>}> }` |
+
+`batchUpdate.samples[].data` 是增量字段：批次内的高频采样点主要包含 CPU、内存、Swap、网速和时间字段；每次上报的最后一个样本会额外携带本次完整报告状态，用于同步磁盘、GPU、进程、连接数、探针、Ping/丢包等报告级数据。
 
 **示例（subscribe=all，带 ID 过滤）**：
 
@@ -558,8 +581,8 @@ interface Server {
   os: string;
   kernel_version: string;
   region: string;
-  ip_v4: '0' | '1';
-  ip_v6: '0' | '1';
+  ip_v4: '0' | '1'; // 公共 REST 接口仅返回 IPv4 可达性
+  ip_v6: '0' | '1'; // 公共 REST 接口仅返回 IPv6 可达性
   boot_time: string;
   agent_version?: string;
   last_updated: number;
@@ -602,7 +625,7 @@ interface WsMessage {
   serverId?: string;
   updates?: Array<{
     serverId: string;
-    samples: Array<{ ts: number; data: Server }>;
+    samples: Array<{ ts: number; data: Partial<Server> }>;
   }>;
 }
 ```
